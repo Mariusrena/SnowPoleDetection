@@ -1,0 +1,38 @@
+
+1 Read chapter 10
+
+2. Familiarize with dataset
+- Not all poles are labeled in the datasets e.g. img2071
+	* This is model destructive, as the model will get contradictory information on what to find
+
+LiDAR = 1024 x 128
+	* Near-IR maps to blue
+	* Signal to green
+	* Reflectivity to red.
+	
+Real = 1920 x 1208
+
+Labels are on YOLO format -> [Class label, center x-coordinate, center y-coordinate, width, height]
+	* Coordinates create a bounding box
+	
+
+3. Read up on pretrained models -> Yolo and others
+
+4. Read up on SOTA in Autonomous Driving
+
+5. Decide on model architecture 
+
+6. Train a model
+
+7. Set up calculation of evalutaion metrics: 
+- Precision
+– Recall
+– map@50
+– mAP@0.5:0.95
+
+
+
+cp /datasets/tdt4265/ad/open/Poles /Documents/tdt4265_datasets
+
+
+scp -r mariumre@idun-login1.hpc.ntnu.no:/cluster/projects/vc/data/ad/open/Poles ~/Downloads/
