@@ -32,22 +32,9 @@ class RGBDataset(Dataset):
             with open(label_path, "r") as label_file:
                 for label in label_file:
                     vals = label.strip().split()
-                    class_id = int(vals[0])
-                    x_center, y_center, width, height = map(float, vals[1:])
+                    class_id, x_center, y_center, width, height = map(float, vals[::])
                     
-                    # Convert to absolute pixel values, easier to work with transformations etc
-                    x_center *= original_w
-                    y_center *= original_h
-                    width *= original_w
-                    height *= original_h
-                    
-                    # Convert from (x_center, y_center, width, height) to (x_min, y_min, x_max, y_max)
-                    x_min = int(x_center - width / 2)
-                    y_min = int(y_center - height / 2)
-                    x_max = int(x_center + width / 2)
-                    y_max = int(y_center + height / 2)
-                    
-                    bboxes.append([x_min, y_min, x_max, y_max, class_id])
+                    bboxes.append([class_id, x_center, y_center, width, height])
         
         # Checks if there is a bbox in the image, should not be an issue with this dataset
         bboxes = torch.tensor(bboxes, dtype=torch.float32) if bboxes else torch.zeros((0, 5))
@@ -59,12 +46,18 @@ class RGBDataset(Dataset):
         return image, bboxes
 
 
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((1920, 1208)),
-    transforms.ToTensor()
-])
-
+transform = A.Compose(
+    [
+        A.SmallestMaxSize(max_size=160),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
+        A.RandomCrop(height=128, width=128),
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
+        A.RandomBrightnessContrast(p=0.5),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        transforms.ToTensor(),
+    ],
+    bbox_params=A.BboxParams(format='coco')
+)   
 
 
 rgb_dataset = RGBDataset(
