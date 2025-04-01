@@ -2,8 +2,8 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 import cv2
-import torchvision.transforms as transforms
 import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 class RGBDataset(Dataset):
     def __init__(self, img_dir, label_dir, img_width = 1920, img_height = 1208, transform=None):
@@ -28,35 +28,42 @@ class RGBDataset(Dataset):
         # Load Label
         label_path = os.path.join(self.label_dir, img_name.replace(".PNG", ".txt").replace(".png", ".txt"))
         bboxes = []
+        labels = []
         if os.path.exists(label_path):
             with open(label_path, "r") as label_file:
                 for label in label_file:
                     vals = label.strip().split()
-                    class_id, x_center, y_center, width, height = map(float, vals[::])
-                    
-                    bboxes.append([class_id, x_center, y_center, width, height])
+                    class_id, x_center, y_center, width, height = map(float, vals)
+                    bboxes.append([x_center, y_center, width, height])  
+                    labels.append(int(class_id))  
         
-        # Checks if there is a bbox in the image, should not be an issue with this dataset
-        bboxes = torch.tensor(bboxes, dtype=torch.float32) if bboxes else torch.zeros((0, 5))
+        if not bboxes: #Should not be a problem with this dataset
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        else:
+            bboxes = torch.tensor(bboxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
 
-        # Resize image and adjust bounding boxes
         if self.transform:
-            image = self.transform(image)
-        
-        return image, bboxes
+            transformed = self.transform(image=image, bboxes=bboxes.tolist(), labels=labels.tolist())
+            image = transformed["image"]
+            bboxes = torch.tensor(transformed["bboxes"], dtype=torch.float32)
+            labels = torch.tensor(transformed["labels"], dtype=torch.int64)
 
-
+        return image, {"boxes": bboxes, "labels": labels}
+    
 transform = A.Compose(
     [
-        A.SmallestMaxSize(max_size=160),
-        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-        A.RandomCrop(height=128, width=128),
-        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
-        A.RandomBrightnessContrast(p=0.5),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        transforms.ToTensor(),
+        A.ChannelDropout(), # Thought is that this will generalize better to shifting wheater conditiotion -> Varying colors
+        A.Defocus(p=0.2), # Snow on the lens or poles that are to far/close to be in the focus of the camera
+        A.GaussNoise(p=0.2), # Some of the same effects as dropout layers in the network
+        A.Illumination(p=0.2), # Shifting light intensity, usual when driving in and out of a forest, snow, etc
+        A.RandomBrightnessContrast(p=0.2), # The camera exposure might be of
+        A.HorizontalFlip(), # To increase sample size
+        A.VerticalFlip(), # To increase sample size
+        ToTensorV2(),
     ],
-    bbox_params=A.BboxParams(format='coco')
+    bbox_params=A.BboxParams(format='yolo', label_fields=["labels"])
 )   
 
 
