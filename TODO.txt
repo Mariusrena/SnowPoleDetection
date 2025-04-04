@@ -2,21 +2,21 @@
 1 Read chapter 10
 
 2. Familiarize with dataset
-- Not all poles are labeled in the datasets e.g. img2071
-	* This is model destructive, as the model will get contradictory information on what to find
+	- Not all poles are labeled in the datasets e.g. img2071
+		* This is model destructive, as the model will get contradictory information on what to find
 
-LiDAR = 1024 x 128
-	* Near-IR maps to blue
-	* Signal to green
-	* Reflectivity to red.
+	LiDAR = 1024 x 128
+		* Near-IR maps to blue
+		* Signal to green
+		* Reflectivity to red.
 	
-Real = 1920 x 1208
+	Real = 1920 x 1208
 
-Labels are on YOLO format -> [Class label, center x-coordinate, center y-coordinate, width, height]
-	* Coordinates create a bounding box
+	Labels are on YOLO format -> [Class label, center x-coordinate, center y-coordinate, width, height]
+		* Coordinates create a bounding box
 	
-Using albumenations for image augmentations. 
-Applying different augmentations to increase samples space and deepen learning of model. 	
+	Using albumentations for image augmentations. 
+	Applying different augmentations to increase samples space and deepen learning of model. 	
 	
 	
 3. Read up on pretrained models -> Yolo and others
@@ -24,12 +24,27 @@ Applying different augmentations to increase samples space and deepen learning o
 4. Read up on SOTA in Autonomous Driving
 
 5. Decide on model architecture 
+	Feature pyramid network -> Giving the "neck" access to different levels of features, meaning features with different level of extraction
+
+	Pytorch RPN handles this:
+		- Loss function for object detection??
+		- Use non-maximum suppression, only keeping the most confident bboxes
+	
+	Model architecture schedule:
+	1. Pure CNN model
+	2. CNN with NN neck: CNN -> RPN -> NN 
+	3. CNN with Cooperator neck
+	4. CNN/ViM Combination -> Producing half of the channels each, ViM is applied to each CNN output
+	5. CNN/ViM with cooperator neck
+	6. CNN/ViT Combination?
+	7. DETR
+	8. Deformable DETR
 
 6. Train a model
 
 7. Set up calculation of evalutaion metrics: 
-- Precision: TP / (TP + FP) -> How many detected objects are correct.
-- Recall: TP / (TP + FN) -> How many real objects were detected.
-– mAP@50 -> Mean Average Precision @ IoU 50
-– mAP@0.5:0.95
+	- Precision: TP / (TP + FP) -> How many detected objects are correct.
+	- Recall: TP / (TP + FN) -> How many real objects were detected.
+	– mAP@50 -> Mean Average Precision @ IoU 50
+	– mAP@0.5:0.95
 
