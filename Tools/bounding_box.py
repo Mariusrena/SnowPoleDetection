@@ -98,6 +98,8 @@ if __name__ == "__main__":
                 cv2.destroyAllWindows()
             elif key == 27:
                 break
+
+            
         except:
             print(f"No label found for {image_path.stem}")
 

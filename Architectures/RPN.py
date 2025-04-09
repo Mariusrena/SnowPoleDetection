@@ -3,8 +3,8 @@ from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionPro
 from torchvision.models.detection.image_list import ImageList 
 
 anchor_generator = AnchorGenerator(
-    sizes=((8, 16, 32, 64, 128, 256),),  
-    aspect_ratios=((0.25, 0.5, 2, 4),)
+    sizes=((32, 64, 128, 256, 512),),  
+    aspect_ratios=((0.05, 0.1 ,0.25, 0.5))
 )
 
 #Set the number of channels from backbone.
@@ -24,7 +24,7 @@ RPN = RegionProposalNetwork(
     bg_iou_thresh=0.3,             # IoU threshold for a background anchor.
     batch_size_per_image=256,      # Total anchors sampled per image during training.
     positive_fraction=0.5,         # Fraction of positive anchors in the mini-batch.
-    pre_nms_top_n=dict(training=2000, testing=200),  # Number of proposals to consider before NMS.
-    post_nms_top_n=dict(training=1000, testing=500), # Number of proposals to keep after NMS.
-    nms_thresh=0.1                 # NMS threshold.
+    pre_nms_top_n=dict(training=2000, testing=1000),  # Number of proposals to consider before NMS.
+    post_nms_top_n=dict(training=1000, testing=300), # Number of proposals to keep after NMS.
+    nms_thresh=0.5                 # NMS threshold.
 )

@@ -48,3 +48,10 @@
 	– mAP@50 -> Mean Average Precision @ IoU 50
 	– mAP@0.5:0.95
 
+
+
+NOTES: 
+ First model: 
+ 	Had trouble finding prediction, likely due to the lack of negative boxes
+ 	LR was to big OR model was to small
+ 	

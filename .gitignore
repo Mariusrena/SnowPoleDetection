@@ -181,3 +181,7 @@ rgb/
 # Do not include dataset
 .png 
 .txt
+
+# Do not include models
+/Trained_Models
+.pt
