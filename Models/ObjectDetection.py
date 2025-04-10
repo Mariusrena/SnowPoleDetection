@@ -14,6 +14,7 @@ from tqdm import tqdm, trange
 import sys
 import os
 import logging
+import time
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
@@ -128,6 +129,7 @@ class ObjectDetectionModel(nn.Module):
             if len(target_boxes) == 0: continue
 
             iou_matrix = ops.box_iou(img_proposals, target_boxes)
+            
             max_iou, matched_gt_idx = iou_matrix.max(dim=1) # Finds the target that best matches a proposal
 
             # Assigns -1 to all proposals
@@ -136,8 +138,8 @@ class ObjectDetectionModel(nn.Module):
             assigned_labels[pos_indices] = 1.0 # Reassigns to 1 if object
             neg_indices = torch.where(max_iou < ROI_BG_IOU_THRESH_LO)[0]
             assigned_labels[neg_indices] = 0.0 # Reassigns to 0 if not an object
-            
-            # Proposals in between threshold stay -1 => irrelecvant
+
+            # Proposals in between threshold stay -1 => irrelevant
             valid_indices = torch.where(assigned_labels >= 0)[0]
             if len(valid_indices) == 0: continue
 
@@ -150,7 +152,7 @@ class ObjectDetectionModel(nn.Module):
             # The feature map from the backbone is aligened with the RPN map to use in the ROI head
             current_features = features['0'] if isinstance(features, dict) else features
             pooled_features = ops.roi_align(
-                current_features, rois, output_size=(5, 5), spatial_scale=spatial_scale
+                current_features, rois, output_size=(3, 3), spatial_scale=spatial_scale
             )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
@@ -176,8 +178,7 @@ class ObjectDetectionModel(nn.Module):
                     pos_refined_boxes, gt_boxes_for_pos_proposals, beta=1.0
                 )
             else:
-                roi_bbox_loss = torch.tensor(0.0, device=current_features.device)
-
+                roi_bbox_loss = torch.tensor(1000.0, device=current_features.device)
 
             img_loss = CLASSIFICATION_LOSS_WEIGHT * roi_class_loss + BBOX_REGRESSION_LOSS_WEIGHT * roi_bbox_loss
 
@@ -285,7 +286,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
     scaler = GradScaler(device)
     
     # Early stopping variables
-    best_val_loss = float('inf')
+    best_val_result = float('inf')
     early_stop_counter = 0
     
     # Training loop
@@ -328,42 +329,48 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}')
         
+        # Learning rate scheduling
+        scheduler.step(avg_train_loss)
+
         # Validation phase
         if val_loader is not None:
-            
-            try: 
-                val_results = validate_model(model, val_loader, device)
+            val_results = validate_model(model, val_loader, device)
 
-                logger.info(f"\nEvaluation Results @ Epoch {epoch+1}/{num_epochs}:")
-                logger.info("--------------------------------------")
-                for metric, value in val_results.items():
-                    logger.info(f"{metric}: {value:.4f}")
-                logger.info("--------------------------------------")
+            logger.info(f"Evaluation Results @ Epoch {epoch+1}/{num_epochs}:")
+            logger.info("--------------------------------------")
+            for metric, value in val_results.items():
+                logger.info(f"{metric}: {value:.4f}")
+            logger.info("--------------------------------------")
+            
+            # Early stopping check
+            if val_results['mAP@0.5'] < best_val_result:
+                best_val_result = val_results['mAP@0.5']
+                early_stop_counter = 0
                 
-                # Learning rate scheduling
-                scheduler.step(val_results["map_50"])
+                # Save best model
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": best_val_result,
+                }, "best_model.pt")
                 
-                # Early stopping check
-                if val_results["map_50"] < best_val_results:
-                    best_val_results = val_results["map_50"]
-                    early_stop_counter = 0
-                    
-                    # Save best model
-                    torch.save({
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "loss": best_val_loss,
-                    }, "best_model.pt")
-                    
-                else:
-                    early_stop_counter += 1
-                    if early_stop_counter >= patience:
-                        logger.info(f'Early stopping triggered after {epoch+1} epochs')
-                        break
-            except:
-                continue
+            else:
+                early_stop_counter += 1
+                if early_stop_counter >= patience and val_results['mAP@0.5'] < 9998:
+                    logger.info(f'Early stopping triggered after {epoch+1} epochs')
+                    break
+        
+        if (epoch + 1) % 20 == 0:
+            torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": best_val_result,
+                }, f"checkpoint_{epoch+1}.pt")
+
     
     # Save final model
     torch.save({
@@ -391,16 +398,17 @@ def validate_model(model, val_loader, device):
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             
             pred_dict = model(images)
-            
-            metric.update([pred_dict], [targets])
+
+            metric.update(pred_dict, targets)
     
         results = metric.compute()
     
         formatted_results = {
-            'mAP@0.5': float(results['map_50'].numpy()),
-            'mAP@0.5:0.95': float(results['map'].numpy()),
-            'Precision': float(results['precision'].numpy()),
-            'Recall': float(results['recall'].numpy()),
+            'mAP@0.5': float(results['map_50'].numpy()) if float(results['map_50'].numpy()) > 0 else 9999,
+            'mAP@0.5:0.95': float(results['map'].numpy()) if float(results['map'].numpy()) > 0 else 9999,
+            'mAR@1': float(results['mar_1'].numpy()) if float(results['mar_1'].numpy()) > 0 else 9999,
+            'mAR@10': float(results['mar_10'].numpy()) if float(results['mar_10'].numpy()) > 0 else 9999,
+            'mAR@100': float(results['mar_100'].numpy()) if float(results['mar_100'].numpy()) > 0 else 9999,
         }
     
         return formatted_results
@@ -409,11 +417,15 @@ if __name__ == "__main__":
     # Model components
     backbone = ConvNet()
     rpn = RPN
-    roi_head = ROI_NN(6400)
+    roi_head = ROI_NN(4608)
     
     # Create integrated model
     model = ObjectDetectionModel(backbone, rpn, roi_head)
-    
+
+    # Load model 
+    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/best_model.pt", weights_only=True)
+    # model.load_state_dict(model_params["model_state_dict"])
+
     # Print model parameters
     backbone_params = sum(p.numel() for p in backbone.parameters())
     rpn_params = sum(p.numel() for p in rpn.parameters())
@@ -428,4 +440,4 @@ if __name__ == "__main__":
     print("#"*40)
     
     # Train model
-    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=500)    
+    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=2000)
