@@ -35,7 +35,7 @@ def eval(model, dataloader):
 
 if __name__ == "__main__":
 
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.load("PATH TO MODEL", device)
     model = model.to(device)
     model.eval()

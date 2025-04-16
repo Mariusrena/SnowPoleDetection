@@ -31,7 +31,10 @@ from Models.Hyperparameters import (ROI_FG_IOU_THRESH,
                                     BBOX_REGRESSION_LOSS_WEIGHT, 
                                     LR, 
                                     LR_SCHEDULER_FACTOR, 
-                                    LR_SCHEDULER_PATIENCE)
+                                    LR_SCHEDULER_PATIENCE,
+                                    EARLY_STOP_PATIENCE,
+                                    SCORE_THRESHOLD,
+                                    NMS_THRESHOLD)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -43,11 +46,11 @@ class ObjectDetectionModel(nn.Module):
         self.rpn = rpn
         self.roi_head = roi_head
 
-    def forward(self, images, targets=None, score_thresh=0.5, nms_thresh=0.5):
+    def forward(self, images, targets=None, score_thresh=SCORE_THRESHOLD, nms_thresh=NMS_THRESHOLD):
         """
         Args:
             images (list[Tensor] or Tensor): Images to process.
-            targets (list[Dict[str, Tensor]], optional): Ground truth annotations. Required during training.
+            targets (list[Dict[str, Tensor]], optional): Ground truth annotations.
             score_thresh (float): Threshold to filter detections based on score during inference.
             nms_thresh (float): IoU threshold for Non-Maximum Suppression during inference.
 
@@ -94,7 +97,7 @@ class ObjectDetectionModel(nn.Module):
             # Process proposals with ROI head for loss calculation
             roi_losses = self.process_roi_proposals(features, proposals, targets)
 
-            # Combine losses from RPN and ROI
+            # Combine losses from RPN and ROI Head
             total_losses = {}
             total_losses.update(proposal_losses)
             if roi_losses is not None:
@@ -129,7 +132,7 @@ class ObjectDetectionModel(nn.Module):
             if len(target_boxes) == 0: continue
 
             iou_matrix = ops.box_iou(img_proposals, target_boxes)
-            
+
             max_iou, matched_gt_idx = iou_matrix.max(dim=1) # Finds the target that best matches a proposal
 
             # Assigns -1 to all proposals
@@ -156,30 +159,59 @@ class ObjectDetectionModel(nn.Module):
             )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
-            refined_boxes, class_scores = self.roi_head(pooled_features)
+            # Box refinement, given as the parameterized offsets of the proposals from targets
+            # Probability that a bbox includes a Snpwpole
+            box_refinement, class_scores = self.roi_head(pooled_features)
 
             # Only use fg/bg samples, not the ones in between
             sampled_assigned_labels = assigned_labels[valid_indices]
             sampled_class_scores = class_scores[valid_indices].squeeze(-1)
 
             # Classification
+            # With logits as autocast is unhappy with "normal" BCE
             roi_class_loss = F.binary_cross_entropy_with_logits(
                 sampled_class_scores, sampled_assigned_labels
             )
 
+            # Get the indices of the positive samples within the sampled_assigned_labels
             pos_mask_in_sampled = (sampled_assigned_labels == 1)
             pos_indices_in_original = valid_indices[pos_mask_in_sampled]
 
             # BBox regression
             if pos_indices_in_original.numel() > 0:
-                pos_refined_boxes = refined_boxes[pos_indices_in_original]
-                gt_boxes_for_pos_proposals = target_boxes[matched_gt_idx[pos_indices_in_original]]
+                # Get the indices of the positive samples within the *valid* indices
+                pos_indices_in_valid = torch.where(sampled_assigned_labels == 1)[0]
+
+                # Use indices to select the corresponding box refinements
+                pos_box_refinement = box_refinement[pos_indices_in_valid]
+                pos_proposals = img_proposals[pos_indices_in_original]
+                gt_boxes = target_boxes[matched_gt_idx[pos_indices_in_original]]
+
+                # Calculate parameterized regression targets
+                proposal_widths = pos_proposals[:, 2] - pos_proposals[:, 0]
+                proposal_heights = pos_proposals[:, 3] - pos_proposals[:, 1]
+                proposal_x_centers = (pos_proposals[:, 0] + pos_proposals[:, 2]) / 2
+                proposal_y_centers = (pos_proposals[:, 1] + pos_proposals[:, 3]) / 2
+
+                gt_widths = gt_boxes[:, 2] - gt_boxes[:, 0]
+                gt_heights = gt_boxes[:, 3] - gt_boxes[:, 1]
+                gt_x_centers = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
+                gt_y_centers = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
+
+                tx = (gt_x_centers - proposal_x_centers) / proposal_widths
+                ty = (gt_y_centers - proposal_y_centers) / proposal_heights
+                tw = torch.log(gt_widths / proposal_widths)
+                th = torch.log(gt_heights / proposal_heights)
+
+                regression_targets = torch.stack((tx, ty, tw, th), dim=1)
+
                 roi_bbox_loss = F.smooth_l1_loss(
-                    pos_refined_boxes, gt_boxes_for_pos_proposals, beta=1.0
+                    pos_box_refinement, regression_targets, beta=1.0
                 )
             else:
-                roi_bbox_loss = torch.tensor(1000.0, device=current_features.device)
+                roi_bbox_loss = torch.tensor(1000, device=current_features.device)
 
+            # Combined loss, might weighting
             img_loss = CLASSIFICATION_LOSS_WEIGHT * roi_class_loss + BBOX_REGRESSION_LOSS_WEIGHT * roi_bbox_loss
 
             if torch.isnan(img_loss) or torch.isinf(img_loss): continue
@@ -190,8 +222,7 @@ class ObjectDetectionModel(nn.Module):
         average_roi_loss = roi_losses / max(valid_batches, 1)
         return average_roi_loss
 
-
-    @torch.no_grad() 
+    @torch.no_grad()
     def process_roi_for_inference(self, features, proposals, image_shapes, score_thresh, nms_thresh):
         """
         Processes proposals through ROI head and applies post-processing for inference.
@@ -208,70 +239,86 @@ class ObjectDetectionModel(nn.Module):
         """
         results = []
         spatial_scale = 1.0 / (2**5) # Calculated based on ConvNet stride (5 maxpools)
-        # Use feature map corresponding to the batch index if features is a dict/list
-        current_features = features['0'] if isinstance(features, dict) else features
+        batch_size = len(proposals)
+        for img_idx in range(batch_size):
+            img_proposals = proposals[img_idx]
 
-        for i, img_proposals in enumerate(proposals):
-            # Empty prediction if no proposals from RPN
-            if len(img_proposals) == 0:
+            if len(img_proposals) == 0: continue
+
+            rois = torch.cat([
+                torch.full((len(img_proposals), 1), img_idx, device=img_proposals.device),
+                img_proposals
+            ], dim=1)
+
+            # Use feature map corresponding to the batch index if features is a dict/list
+            # The feature map from the backbone is aligened with the RPN map to use in the ROI head
+            current_features = features['0'] if isinstance(features, dict) else features
+            pooled_features = ops.roi_align(
+                current_features, rois, output_size=(3, 3), spatial_scale=spatial_scale
+            )
+            pooled_features = pooled_features.view(pooled_features.size(0), -1)
+
+            box_refinement, class_scores = self.roi_head(pooled_features)
+
+            # Convert logits to probabilities using sigmoid
+            scores = torch.sigmoid(class_scores.squeeze(-1)) # Remove last dim if it's 1
+
+            # Filter by score threshold
+            keep_inds = scores >= score_thresh
+            filtered_proposals = img_proposals[keep_inds]
+            filtered_box_refinement = box_refinement[keep_inds]
+            filtered_scores = scores[keep_inds]
+
+            if keep_inds.numel() == 0:
                 results.append({"boxes": torch.empty((0, 4), device=current_features.device),
                                 "scores": torch.empty((0,), device=current_features.device),
                                 "labels": torch.empty((0,), dtype=torch.int64, device=current_features.device)})
                 continue
 
-            # Prepare ROIs for roi_align
-            rois = torch.cat([
-                torch.full((len(img_proposals), 1), i, device=img_proposals.device), # Batch index
-                img_proposals
-            ], dim=1)
+            # Applying the inverse transformation to get final boxes
+            proposal_widths = filtered_proposals[:, 2] - filtered_proposals[:, 0]
+            proposal_heights = filtered_proposals[:, 3] - filtered_proposals[:, 1]
+            proposal_x_centers = (filtered_proposals[:, 0] + filtered_proposals[:, 2]) / 2
+            proposal_y_centers = (filtered_proposals[:, 1] + filtered_proposals[:, 3]) / 2
 
-            # Extract features using ROI align
-            pooled_features = ops.roi_align(
-                current_features, rois, output_size=(5, 5), spatial_scale=spatial_scale
-            )
-            pooled_features = pooled_features.view(pooled_features.size(0), -1)
+            predicted_tx = filtered_box_refinement[:, 0]
+            predicted_ty = filtered_box_refinement[:, 1]
+            predicted_tw = filtered_box_refinement[:, 2]
+            predicted_th = filtered_box_refinement[:, 3]
 
-            # Forward pass through ROI head
-            refined_boxes, class_logits = self.roi_head(pooled_features)
+            pred_x_centers = proposal_x_centers + predicted_tx * proposal_widths
+            pred_y_centers = proposal_y_centers + predicted_ty * proposal_heights
+            pred_widths = proposal_widths * torch.exp(predicted_tw)
+            pred_heights = proposal_heights * torch.exp(predicted_th)
 
-            # Convert logits to probabilities using sigmoid
-            scores = torch.sigmoid(class_logits).squeeze(-1) # Remove last dim if it's 1
-
-            
-            # Filter by score threshold
-            keep_inds = scores >= score_thresh
-            filtered_boxes = refined_boxes[keep_inds]
-            filtered_scores = scores[keep_inds]
-
-            if filtered_boxes.numel() == 0:
-                 results.append({"boxes": torch.empty((0, 4), device=current_features.device),
-                                "scores": torch.empty((0,), device=current_features.device),
-                                "labels": torch.empty((0,), dtype=torch.int64, device=current_features.device)})
-                 continue
+            # Convert back to (xmin, ymin, xmax, ymax)
+            filtered_boxes = torch.zeros_like(filtered_proposals)
+            filtered_boxes[:, 0] = pred_x_centers - pred_widths / 2
+            filtered_boxes[:, 1] = pred_y_centers - pred_heights / 2
+            filtered_boxes[:, 2] = pred_x_centers + pred_widths / 2
+            filtered_boxes[:, 3] = pred_y_centers + pred_heights / 2
 
             # Clip boxes to image boundaries
-            # image_shapes should contain (height, width) for the i-th image
-            img_h, img_w = image_shapes[i]
+            img_h, img_w = image_shapes[img_idx]
             filtered_boxes[:, [0, 2]] = filtered_boxes[:, [0, 2]].clamp(min=0, max=img_w)
             filtered_boxes[:, [1, 3]] = filtered_boxes[:, [1, 3]].clamp(min=0, max=img_h)
 
-            # Assign labels - Binary classification (label 1 for "object", 0 for background)
-            # All boxes passing the score threshold are considered "object" 
-            filtered_labels = torch.ones_like(filtered_scores, dtype=torch.int64)
+            # Assign labels - Binary classification (label 0 for "object")
+            filtered_labels = torch.zeros_like(filtered_scores, dtype=torch.int64)
 
             # Apply Non-Maximum Suppression (NMS)
             nms_keep_indices = ops.nms(filtered_boxes, filtered_scores, nms_thresh)
 
             final_boxes = filtered_boxes[nms_keep_indices]
             final_scores = filtered_scores[nms_keep_indices]
-            final_labels = filtered_labels[nms_keep_indices] # All will be 1
+            final_labels = filtered_labels[nms_keep_indices] # All will be 0
 
             results.append({"boxes": final_boxes, "scores": final_scores, "labels": final_labels})
 
         return results
 
 
-def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cuda", patience=50):
+def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cuda"):
     # Device configuration
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -358,7 +405,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
                 
             else:
                 early_stop_counter += 1
-                if early_stop_counter >= patience and val_results['mAP@0.5'] < 9998:
+                if early_stop_counter >= EARLY_STOP_PATIENCE and val_results['mAP@0.5'] < 9998:
                     logger.info(f'Early stopping triggered after {epoch+1} epochs')
                     break
         
@@ -387,9 +434,8 @@ def validate_model(model, val_loader, device):
     
     with torch.no_grad():
         metric = MeanAveragePrecision(
-            box_format='xyxy',  
-            iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-            rec_thresholds=None,
+            iou_type="bbox",
+            box_format='xyxy',
         )
         
         for images, targets in val_loader:
@@ -400,9 +446,9 @@ def validate_model(model, val_loader, device):
             pred_dict = model(images)
 
             metric.update(pred_dict, targets)
-    
+
         results = metric.compute()
-    
+
         formatted_results = {
             'mAP@0.5': float(results['map_50'].numpy()) if float(results['map_50'].numpy()) > 0 else 9999,
             'mAP@0.5:0.95': float(results['map'].numpy()) if float(results['map'].numpy()) > 0 else 9999,
@@ -423,7 +469,7 @@ if __name__ == "__main__":
     model = ObjectDetectionModel(backbone, rpn, roi_head)
 
     # Load model 
-    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/best_model.pt", weights_only=True)
+    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/current_best.pt", weights_only=True)
     # model.load_state_dict(model_params["model_state_dict"])
 
     # Print model parameters
