@@ -263,7 +263,7 @@ class ObjectDetectionModel(nn.Module):
             # Convert logits to probabilities using sigmoid
             scores = torch.sigmoid(class_scores.squeeze(-1)) # Remove last dim if it's 1
 
-            # Filter by score threshold
+            # Filter by score threshold (probability of snow pole in bbox)
             keep_inds = scores >= score_thresh
             filtered_proposals = img_proposals[keep_inds]
             filtered_box_refinement = box_refinement[keep_inds]
@@ -298,7 +298,7 @@ class ObjectDetectionModel(nn.Module):
             filtered_boxes[:, 2] = pred_x_centers + pred_widths / 2
             filtered_boxes[:, 3] = pred_y_centers + pred_heights / 2
 
-            # Clip boxes to image boundaries
+            # Clip boxes to image boundaries (likely not a problem in this task)
             img_h, img_w = image_shapes[img_idx]
             filtered_boxes[:, [0, 2]] = filtered_boxes[:, [0, 2]].clamp(min=0, max=img_w)
             filtered_boxes[:, [1, 3]] = filtered_boxes[:, [1, 3]].clamp(min=0, max=img_h)
