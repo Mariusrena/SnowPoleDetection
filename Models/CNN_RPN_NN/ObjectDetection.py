@@ -25,16 +25,21 @@ from Architectures.RPN import RPN
 from Architectures.NN import ROI_NN
 from Tools.rgb_dataloader import rgb_trainloader, rgb_validloader
 
-from Models.Hyperparameters import (ROI_FG_IOU_THRESH, 
+from Models.CNN_RPN_NN.Hyperparameters import (ROI_ALIGN_SPATIAL_SCALE,
+                                    ROI_ALIGN_OUTPUT_SIZE,
+                                    NUM_CNN_OUTPUT_CHANNELS,
+                                    ROI_FG_IOU_THRESH,
                                     ROI_BG_IOU_THRESH_LO, 
                                     CLASSIFICATION_LOSS_WEIGHT, 
                                     BBOX_REGRESSION_LOSS_WEIGHT, 
+                                    SCORE_THRESHOLD,
+                                    NMS_THRESHOLD,
                                     LR, 
                                     LR_SCHEDULER_FACTOR, 
                                     LR_SCHEDULER_PATIENCE,
                                     EARLY_STOP_PATIENCE,
-                                    SCORE_THRESHOLD,
-                                    NMS_THRESHOLD)
+                                    GRADIENT_CLIPPING_MAX_NORM,
+                                    NUM_EPOCHS,)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -78,7 +83,6 @@ class ObjectDetectionModel(nn.Module):
         # Use original_image_sizes if available, otherwise calculate from tensor
         image_list = ImageList(images, [(img.shape[-2], img.shape[-1]) for img in images])
 
-
         # Get proposals from RPN
         # Pass targets only during training
         proposals, proposal_losses = self.rpn(image_list, {'0': features}, targets if self.training else None)
@@ -106,7 +110,6 @@ class ObjectDetectionModel(nn.Module):
 
             return total_losses
 
-
     def process_roi_proposals(self, features, proposals, targets):
         """
         Processes proposals through ROI head and calculated loss for training.
@@ -119,7 +122,6 @@ class ObjectDetectionModel(nn.Module):
         Returns:
             float: Calculated Loss.
         """
-        spatial_scale = 1.0 / (2**5) # Calculated based on ConvNet stride (5 maxpools)
         batch_size = len(proposals)
         roi_losses = 0
         valid_batches = 0 # Count images that contribute to loss
@@ -155,11 +157,11 @@ class ObjectDetectionModel(nn.Module):
             # The feature map from the backbone is aligened with the RPN map to use in the ROI head
             current_features = features['0'] if isinstance(features, dict) else features
             pooled_features = ops.roi_align(
-                current_features, rois, output_size=(3, 3), spatial_scale=spatial_scale
+                current_features, rois, output_size=(ROI_ALIGN_OUTPUT_SIZE, ROI_ALIGN_OUTPUT_SIZE), spatial_scale=ROI_ALIGN_SPATIAL_SCALE
             )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
-            # Box refinement, given as the parameterized offsets of the proposals from targets
+            # Box refinement
             # Probability that a bbox includes a Snpwpole
             box_refinement, class_scores = self.roi_head(pooled_features)
 
@@ -208,6 +210,7 @@ class ObjectDetectionModel(nn.Module):
                 roi_bbox_loss = F.smooth_l1_loss(
                     pos_box_refinement, regression_targets, beta=1.0
                 )
+
             else:
                 roi_bbox_loss = torch.tensor(1000, device=current_features.device)
 
@@ -238,7 +241,6 @@ class ObjectDetectionModel(nn.Module):
             list[dict{'boxes': Tensor, 'scores': Tensor, 'labels': Tensor}]: Final detections.
         """
         results = []
-        spatial_scale = 1.0 / (2**5) # Calculated based on ConvNet stride (5 maxpools)
         batch_size = len(proposals)
         for img_idx in range(batch_size):
             img_proposals = proposals[img_idx]
@@ -254,7 +256,7 @@ class ObjectDetectionModel(nn.Module):
             # The feature map from the backbone is aligened with the RPN map to use in the ROI head
             current_features = features['0'] if isinstance(features, dict) else features
             pooled_features = ops.roi_align(
-                current_features, rois, output_size=(3, 3), spatial_scale=spatial_scale
+                current_features, rois, output_size=(ROI_ALIGN_OUTPUT_SIZE, ROI_ALIGN_OUTPUT_SIZE), spatial_scale=ROI_ALIGN_SPATIAL_SCALE
             )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
@@ -351,27 +353,23 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
             # Zero gradients
             optimizer.zero_grad()
             
-            try:
-                # Forward pass with mixed precision
-                with autocast(str(device)):
-                    losses = model(images, targets)
-                    loss = sum(loss for loss in losses.values())
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                # Optimizer step
-                scaler.step(optimizer)
-                scaler.update()
-                # Update progress
-                batch_loss = loss.item()
-                train_loss += batch_loss
-                batch_loop.set_postfix(loss=f"{batch_loss:.4f}")
+            # Forward pass with mixed precision
+            with autocast(str(device)):
+                losses = model(images, targets)
+                loss = sum(loss for loss in losses.values())
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIPPING_MAX_NORM)
+            # Optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+            # Update progress
+            batch_loss = loss.item()
+            train_loss += batch_loss
+            batch_loop.set_postfix(loss=f"{batch_loss:.4f}")
             
-            except Exception as e:
-                logger.error(f"Error in training batch: {e}")
-                continue
         
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}')
@@ -463,7 +461,7 @@ if __name__ == "__main__":
     # Model components
     backbone = ConvNet()
     rpn = RPN
-    roi_head = ROI_NN(4608)
+    roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) # Pass number of input features
     
     # Create integrated model
     model = ObjectDetectionModel(backbone, rpn, roi_head)
@@ -486,4 +484,4 @@ if __name__ == "__main__":
     print("#"*40)
     
     # Train model
-    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=2000)
+    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=NUM_EPOCHS)

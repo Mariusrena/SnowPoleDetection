@@ -1,6 +1,5 @@
 import cv2
 from pathlib import Path
-import numpy as np
 
 # Draw bounding boxes from YOLO format
 def draw_bounding_box(image_path, label_path, prediction_path = None):
@@ -49,35 +48,7 @@ def draw_bounding_box(image_path, label_path, prediction_path = None):
 
     key = cv2.waitKey(0)
     return key
-
-def draw_bb_on_prediction(image, labels, preds):
-
-    image = image.squeeze(0)
-    image = image.permute(1, 2, 0)
-    image = (image.numpy() * 255).astype(np.uint8)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)          
-
-    for label in labels:
-        x1 = int(label[0])
-        y1 = int(label[1])
-        x2 = int(label[2])
-        y2 = int(label[3])
-
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
     
-    #for pred in preds:
-    x1 = int(preds[0])
-    y1 = int(preds[1])
-    x2 = int(preds[2])
-    y2 = int(preds[3])
-
-    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2, cv2.LINE_4)
-
-    cv2.imshow("Snow Pole BBox", image)
-
-    key = cv2.waitKey(0)
-    return key
 
 
 if __name__ == "__main__":
@@ -98,8 +69,6 @@ if __name__ == "__main__":
                 cv2.destroyAllWindows()
             elif key == 27:
                 break
-
-            
         except:
             print(f"No label found for {image_path.stem}")
 

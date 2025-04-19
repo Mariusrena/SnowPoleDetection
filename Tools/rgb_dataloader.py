@@ -65,7 +65,7 @@ class RGBDataset(Dataset):
 
         return image, {"boxes": bboxes, "labels": labels}
     
-train_transform = A.Compose(
+transform = A.Compose(
     [
         A.ChannelDropout(), # Thought is that this will generalize better to shifting wheater conditiotion -> Varying colors
         A.Defocus(p=0.2), # Snow on the lens or poles that are to far/close to be in the focus of the camera
@@ -85,8 +85,8 @@ valid_transform = A.Compose(
         A.ToFloat(max_value=255),
         ToTensorV2(),
     ],
-    bbox_params=A.BboxParams(format='pascal_voc', label_fields=["labels"])
-)   
+)
+   
 
 
 def collate_fn(batch):
@@ -95,15 +95,15 @@ def collate_fn(batch):
     return images, list(labels)  # Keep labels as a list (variable size)
 
 rgb_trainset = RGBDataset(
-    img_dir="/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/images/train",
-    label_dir="/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/labels/train",
-    transform=train_transform)
+    img_dir="/home/mariumre/Documents/SnowPoleDetection/Poles/rgb/images/train",
+    label_dir="/home/mariumre/Documents/SnowPoleDetection/Poles/rgb/labels/train",
+    transform=transform)
 
-rgb_trainloader = DataLoader(rgb_trainset, batch_size=1, shuffle=True, collate_fn=collate_fn)
+rgb_trainloader = DataLoader(rgb_trainset, batch_size=6, shuffle=True, collate_fn=collate_fn)
 
 rgb_validset = RGBDataset(
-    img_dir="/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/images/valid",
-    label_dir="/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/labels/valid",
+    img_dir="/home/mariumre/Documents/SnowPoleDetection/Poles/rgb/images/valid",
+    label_dir="/home/mariumre/Documents/SnowPoleDetection/Poles/rgb/labels/valid",
     transform=valid_transform)
 
 rgb_validloader = DataLoader(rgb_validset, batch_size=1, shuffle=True, collate_fn=collate_fn)
