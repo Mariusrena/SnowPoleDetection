@@ -42,10 +42,31 @@ from FPN_RPN_NN.Hyperparameters import (
                                     LR_SCHEDULER_PATIENCE,
                                     EARLY_STOP_PATIENCE,
                                     GRADIENT_CLIPPING_MAX_NORM,
-                                    NUM_EPOCHS,)
+                                    NUM_EPOCHS,
+                                    RPN_ONLY,)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def focal_loss(prediction, target, alpha=0.25, gamma=2.0):
+    """Compute focal loss for binary classification"""
+    pt = torch.where(target == 1, prediction, 1 - prediction)
+    alpha_factor = torch.where(target == 1, alpha, 1 - alpha)
+    focal_weight = alpha_factor * torch.pow(1 - pt, gamma)
+    loss = -focal_weight * torch.log(pt + 1e-10)
+    return loss.mean()
+
+def freeze_module(module):
+    """Sets requires_grad=False for all parameters in a module."""
+    logger.info(f"Freezing parameters for {module.__class__.__name__}")
+    for param in module.parameters():
+        param.requires_grad = False
+
+def unfreeze_module(module):
+    """Sets requires_grad=True for all parameters in a module."""
+    logger.info(f"Unfreezing parameters for {module.__class__.__name__}")
+    for param in module.parameters():
+        param.requires_grad = True
 
 class ObjectDetectionModel(nn.Module):
     def __init__(self, backbone, rpn, roi_head):
@@ -57,10 +78,10 @@ class ObjectDetectionModel(nn.Module):
         self.roi_align = ops.MultiScaleRoIAlign(
             featmap_names = ["0", "1", "2"],
             output_size = (ROI_ALIGN_OUTPUT_SIZE, ROI_ALIGN_OUTPUT_SIZE),
-            sampling_ratio = 2
+            sampling_ratio = 4
         )
 
-    def forward(self, images, targets=None, score_thresh=SCORE_THRESHOLD, nms_thresh=NMS_THRESHOLD):
+    def forward(self, images, targets=None, score_thresh=SCORE_THRESHOLD, nms_thresh=NMS_THRESHOLD, rpn_only=RPN_ONLY):
         """
         Args:
             images (list[Tensor] or Tensor): Images to process.
@@ -94,10 +115,15 @@ class ObjectDetectionModel(nn.Module):
 
         # Get proposals from RPN
         # Pass targets only during training
-        proposals, proposal_losses = self.rpn(image_list, features, targets if self.training else None)
+
+        proposals, rpn_scores, proposal_losses = self.rpn(image_list, features, targets if self.training else None)
 
         # INFERENCE
         if not self.training:
+            if rpn_only:
+                predictions = self.process_rpn_for_inference(rpn_scores[0], proposals[0], targets, image_list.image_sizes)
+                return predictions
+            
             # Get predictions from ROI head 
             predictions = self.process_roi_for_inference(features, proposals, image_list.image_sizes, score_thresh, nms_thresh)
             return predictions 
@@ -107,19 +133,70 @@ class ObjectDetectionModel(nn.Module):
             if targets is None:
                 raise ValueError("Targets should not be None during training")
 
-            # Process proposals with ROI head for loss calculation
-            roi_losses = self.process_roi_proposals(features, proposals, targets)
-
-            # Combine losses from RPN and ROI Head
             total_losses = {}
             total_losses.update(proposal_losses)
+
+            if rpn_only:
+                return total_losses
+
+            # Process proposals with ROI head for loss calculation
+            roi_losses = self.process_roi_proposals(features, proposals, targets, image_list.image_sizes)
+
+            # Combine losses from RPN and ROI Head
             if roi_losses is not None:
                 # Ensure the key matches what train_model expects
                 total_losses['loss_roi'] = roi_losses
 
             return total_losses
 
-    def process_roi_proposals(self, features, proposals, targets):
+    @torch.no_grad()
+    def process_rpn_for_inference(self, scores, proposals, targets, image_shapes, score_thresh=SCORE_THRESHOLD, nms_thresh=NMS_THRESHOLD):
+        """
+        Processes proposals from RPN and applies post-processing for inference.
+
+        Args:
+            scores (list[Tensor]): Scores from RPNw.
+            proposals (list[Tensor]): Proposals from RPN for each image.
+            image_shapes (list[tuple[int, int]]): Original image sizes (H, W).
+            score_thresh (float): Score threshold for filtering.
+            nms_thresh (float): NMS IoU threshold.
+
+        Returns:
+            list[dict{'boxes': Tensor, 'scores': Tensor, 'labels': Tensor}]: Final detections.
+        """
+        results = []
+        
+        # Filter by score threshold (probability of snow pole in bbox)
+        keep_inds = scores >= score_thresh
+        filtered_proposals = proposals[keep_inds]
+        filtered_scores = scores[keep_inds]
+
+        if keep_inds.numel() == 0:
+            results.append({"boxes": torch.empty((0, 4), device=pooled_features.device),
+                            "scores": torch.empty((0,), device=pooled_features.device),
+                            "labels": torch.empty((0,), dtype=torch.int64, device=pooled_features.device)})
+
+        else:
+            # Clip boxes to image boundaries (likely not a problem in this task)
+            img_h, img_w = image_shapes[0]
+            filtered_proposals[:, [0, 2]] = filtered_proposals[:, [0, 2]].clamp(min=0, max=img_w)
+            filtered_proposals[:, [1, 3]] = filtered_proposals[:, [1, 3]].clamp(min=0, max=img_h)
+
+            # Assign labels - Binary classification (label 1 for "object")
+            filtered_labels = torch.ones_like(filtered_scores, dtype=torch.int64)
+
+            # Apply Non-Maximum Suppression (NMS)
+            nms_keep_indices = ops.nms(filtered_proposals, filtered_scores, nms_thresh)
+
+            final_boxes = filtered_proposals[nms_keep_indices]
+            final_scores = filtered_scores[nms_keep_indices]
+            final_labels = filtered_labels[nms_keep_indices] # All will be 1
+
+            results.append({"boxes": final_boxes, "scores": final_scores, "labels": final_labels})
+
+        return results
+
+    def process_roi_proposals(self, features, proposals, targets, image_shapes):
         """
         Processes proposals through ROI head and calculated loss for training.
 
@@ -165,7 +242,7 @@ class ObjectDetectionModel(nn.Module):
             # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
             pooled_features = self.roi_align(features,                
                                             [img_proposals],          
-                                            [(1920,1208)]
+                                            [image_shapes[img_idx]]
                                         )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
@@ -179,8 +256,12 @@ class ObjectDetectionModel(nn.Module):
 
             # Classification
             # With logits as autocast is unhappy with "normal" BCE
-            roi_class_loss = F.binary_cross_entropy_with_logits(
-                sampled_class_scores, sampled_assigned_labels
+            #roi_class_loss = F.binary_cross_entropy_with_logits(
+            #    sampled_class_scores, sampled_assigned_labels
+            #)
+
+            roi_class_loss = focal_loss(
+                torch.sigmoid(sampled_class_scores), sampled_assigned_labels
             )
 
             # Get the indices of the positive samples within the sampled_assigned_labels
@@ -189,11 +270,8 @@ class ObjectDetectionModel(nn.Module):
 
             # BBox regression
             if pos_indices_in_original.numel() > 0:
-                # Get the indices of the positive samples within the *valid* indices
-                pos_indices_in_valid = torch.where(sampled_assigned_labels == 1)[0]
-
                 # Use indices to select the corresponding box refinements
-                pos_box_refinement = box_refinement[pos_indices_in_valid]
+                pos_box_refinement = box_refinement[pos_indices_in_original]
                 pos_proposals = img_proposals[pos_indices_in_original]
                 gt_boxes = target_boxes[matched_gt_idx[pos_indices_in_original]]
 
@@ -214,17 +292,17 @@ class ObjectDetectionModel(nn.Module):
                 th = torch.log(gt_heights / proposal_heights)
 
                 regression_targets = torch.stack((tx, ty, tw, th), dim=1)
-
+                
                 roi_bbox_loss = F.smooth_l1_loss(
                     pos_box_refinement, regression_targets, beta=1.0
                 )
 
             else:
-                roi_bbox_loss = torch.tensor(100, device=pooled_features.device)
+                roi_bbox_loss = torch.tensor(1000, device=pooled_features.device)
 
             # Combined loss, might weighting
             img_loss = CLASSIFICATION_LOSS_WEIGHT * roi_class_loss + BBOX_REGRESSION_LOSS_WEIGHT * roi_bbox_loss
-
+            
             if torch.isnan(img_loss) or torch.isinf(img_loss): continue
 
             roi_losses += img_loss
@@ -263,7 +341,7 @@ class ObjectDetectionModel(nn.Module):
             # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
             pooled_features = self.roi_align(features,                
                                             [img_proposals],          
-                                            [(1920,1208)]
+                                            [image_shapes[img_idx]]
                                         )
             pooled_features = pooled_features.view(pooled_features.size(0), -1)
 
@@ -279,9 +357,9 @@ class ObjectDetectionModel(nn.Module):
             filtered_scores = scores[keep_inds]
 
             if keep_inds.numel() == 0:
-                results.append({"boxes": torch.empty((0, 4), device=current_features.device),
-                                "scores": torch.empty((0,), device=current_features.device),
-                                "labels": torch.empty((0,), dtype=torch.int64, device=current_features.device)})
+                results.append({"boxes": torch.empty((0, 4), device=pooled_features.device),
+                                "scores": torch.empty((0,), device=pooled_features.device),
+                                "labels": torch.empty((0,), dtype=torch.int64, device=pooled_features.device)})
                 continue
 
             # Applying the inverse transformation to get final boxes
@@ -312,22 +390,22 @@ class ObjectDetectionModel(nn.Module):
             filtered_boxes[:, [0, 2]] = filtered_boxes[:, [0, 2]].clamp(min=0, max=img_w)
             filtered_boxes[:, [1, 3]] = filtered_boxes[:, [1, 3]].clamp(min=0, max=img_h)
 
-            # Assign labels - Binary classification (label 0 for "object")
-            filtered_labels = torch.zeros_like(filtered_scores, dtype=torch.int64)
+            # Assign labels - Binary classification (label 1 for "object")
+            filtered_labels = torch.ones_like(filtered_scores, dtype=torch.int64)
 
             # Apply Non-Maximum Suppression (NMS)
             nms_keep_indices = ops.nms(filtered_boxes, filtered_scores, nms_thresh)
 
             final_boxes = filtered_boxes[nms_keep_indices]
             final_scores = filtered_scores[nms_keep_indices]
-            final_labels = filtered_labels[nms_keep_indices] # All will be 0
+            final_labels = filtered_labels[nms_keep_indices] # All will be 1
 
             results.append({"boxes": final_boxes, "scores": final_scores, "labels": final_labels})
 
         return results
 
 
-def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cuda"):
+def train_model(model, train_loader, val_loader=None, num_epochs=100, freeze_epochs=50, device="cuda"):
     # Device configuration
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -342,7 +420,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
     scaler = GradScaler(device)
     
     # Early stopping variables
-    best_val_result = float('inf')
+    best_val_result = 0.0 #mAP@50 value
     early_stop_counter = 0
     
     # Training loop
@@ -376,8 +454,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
             batch_loss = loss.item()
             train_loss += batch_loss
             batch_loop.set_postfix(loss=f"{batch_loss:.4f}")
-            
-        
+
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}')
         
@@ -395,7 +472,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
             logger.info("--------------------------------------")
             
             # Early stopping check
-            if val_results['mAP@0.5'] < best_val_result:
+            if val_results['mAP@0.5'] > best_val_result:
                 best_val_result = val_results['mAP@0.5']
                 early_stop_counter = 0
                 
@@ -410,7 +487,7 @@ def train_model(model, train_loader, val_loader=None, num_epochs=100, device="cu
                 
             else:
                 early_stop_counter += 1
-                if early_stop_counter >= EARLY_STOP_PATIENCE and val_results['mAP@0.5'] < 9998:
+                if early_stop_counter >= EARLY_STOP_PATIENCE and val_results['mAP@0.5'] > 0:
                     logger.info(f'Early stopping triggered after {epoch+1} epochs')
                     break
         
@@ -455,11 +532,11 @@ def validate_model(model, val_loader, device):
         results = metric.compute()
 
         formatted_results = {
-            'mAP@0.5': float(results['map_50'].numpy()) if float(results['map_50'].numpy()) > 0 else 9999,
-            'mAP@0.5:0.95': float(results['map'].numpy()) if float(results['map'].numpy()) > 0 else 9999,
-            'mAR@1': float(results['mar_1'].numpy()) if float(results['mar_1'].numpy()) > 0 else 9999,
-            'mAR@10': float(results['mar_10'].numpy()) if float(results['mar_10'].numpy()) > 0 else 9999,
-            'mAR@100': float(results['mar_100'].numpy()) if float(results['mar_100'].numpy()) > 0 else 9999,
+            'mAP@0.5': float(results['map_50'].numpy()) if float(results['map_50'].numpy()) > 0 else 0,
+            'mAP@0.5:0.95': float(results['map'].numpy()) if float(results['map'].numpy()) > 0 else 0,
+            'mAR@1': float(results['mar_1'].numpy()) if float(results['mar_1'].numpy()) > 0 else 0,
+            'mAR@10': float(results['mar_10'].numpy()) if float(results['mar_10'].numpy()) > 0 else 0,
+            'mAR@100': float(results['mar_100'].numpy()) if float(results['mar_100'].numpy()) > 0 else 0,
         }
     
         return formatted_results
@@ -474,7 +551,7 @@ if __name__ == "__main__":
     model = ObjectDetectionModel(backbone, rpn, roi_head)
 
     # Load model 
-    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/current_best.pt", weights_only=True)
+    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/FPN_RPN_NN/checkpoint_20.pt", weights_only=True)
     # model.load_state_dict(model_params["model_state_dict"])
 
     # Print model parameters
@@ -491,4 +568,4 @@ if __name__ == "__main__":
     print("#"*40)
     
     # Train model
-    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=NUM_EPOCHS)
+    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=NUM_EPOCHS) 
