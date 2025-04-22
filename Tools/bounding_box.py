@@ -14,7 +14,7 @@ def draw_bounding_box(image_path, label_path, prediction_path = None):
     for label in labels:
         values = label.strip().split()
         class_id = int(values[0])
-        x_center, y_center, bb_width, bb_height = map(float, values[1:])
+        x_center, y_center, bb_width, bb_height, score = map(float, values[1:])
 
         # Convert YOLO format to pixel values
         x1 = int((x_center - bb_width / 2) * image_width)
@@ -56,9 +56,9 @@ if __name__ == "__main__":
     # Iterates through a folder, using the filename to find linked label in another folder
     # Use ENTER to see next image and ESC to quit. 
 
-    image_paths = Path("/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/images/train")
+    image_paths = Path("/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/images/test")
     
-    label_paths = "/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Poles/rgb/labels/train"
+    label_paths = r"/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/8.5M/Test_Predictions"
 
     for image_path in image_paths.iterdir():
         try:

@@ -51,17 +51,17 @@ class ResidualBlock(nn.Module):
 class ConvFPN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv_layer1 = ConvBlock(3, 64, True, kernel_size=3, stride=1)
-        self.res_block1 = ResidualBlock(64, True, 3)
-        self.down_sample1 = ConvBlock(64, 128, kernel_size=3, stride=2) # Replaces Maxpool
-        self.res_block2 = ResidualBlock(128, True, 5)
-        self.down_sample2 = ConvBlock(128, 256, kernel_size=3, stride=2) # Replaces Maxpool
-        self.res_block3 = ResidualBlock(256, True, 5)
-        self.down_sample3 = ConvBlock(256, NUM_CNN_OUTPUT_CHANNELS, kernel_size=3, stride=2) # Replaces Maxpool
+        self.conv_layer1 = ConvBlock(3, 128, True, kernel_size=3, stride=1)
+        self.res_block1 = ResidualBlock(128, True, 2)
+        self.down_sample1 = ConvBlock(128, 256, kernel_size=3, stride=2) # Replaces Maxpool
+        self.res_block2 = ResidualBlock(256, True, 4)
+        self.down_sample2 = ConvBlock(256, 384, kernel_size=3, stride=2) # Replaces Maxpool
+        self.res_block3 = ResidualBlock(384, True, 4)
+        self.down_sample3 = ConvBlock(384, NUM_CNN_OUTPUT_CHANNELS, kernel_size=3, stride=2) # Replaces Maxpool
 
         # Lateral 1x1 Convs to match top-down channels
-        self.lat2 = nn.Conv2d(128, NUM_CNN_OUTPUT_CHANNELS, 1, padding=0)
-        self.lat3 = nn.Conv2d(256, NUM_CNN_OUTPUT_CHANNELS, 1, padding=0)
+        self.lat2 = nn.Conv2d(256, NUM_CNN_OUTPUT_CHANNELS, 1, padding=0)
+        self.lat3 = nn.Conv2d(384, NUM_CNN_OUTPUT_CHANNELS, 1, padding=0)
         self.lat4 = nn.Conv2d(NUM_CNN_OUTPUT_CHANNELS, NUM_CNN_OUTPUT_CHANNELS, 1, padding=0)
 
         # Output 3x3 convs to smooth after fusion

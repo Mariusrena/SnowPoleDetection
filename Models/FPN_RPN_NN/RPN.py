@@ -87,7 +87,8 @@ class CutsomRPN(RegionProposalNetwork):
 
 rpn_head = RPNHead(
     NUM_CNN_OUTPUT_CHANNELS,
-    anchor_generator.num_anchors_per_location()[0]
+    anchor_generator.num_anchors_per_location()[0],
+    conv_depth = 5
 )
 
 # Instantiate the RegionProposalNetwork with desired parameters.

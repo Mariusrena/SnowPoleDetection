@@ -1,3 +1,4 @@
+
 """ External Imports """
 import torch
 import torch.optim as optim
@@ -26,7 +27,7 @@ sys.path.append(project_root)
 from FPN_RPN_NN.CNN_FPN import ConvFPN
 from FPN_RPN_NN.RPN import RPN
 from FPN_RPN_NN.NN import ROI_NN
-from Tools.rgb_dataloader import rgb_trainloader, rgb_validloader
+from Tools.predict_dataloader import rgb_testloader, collate_fn_save
 
 from FPN_RPN_NN.Hyperparameters import (
                                     ROI_ALIGN_OUTPUT_SIZE,
@@ -48,26 +49,6 @@ from FPN_RPN_NN.Hyperparameters import (
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-def focal_loss(prediction, target, alpha=0.75, gamma=2.0):
-    """Compute focal loss for binary classification"""
-    pt = torch.where(target == 1, prediction, 1 - prediction)
-    alpha_factor = torch.where(target == 1, alpha, 1 - alpha)
-    focal_weight = alpha_factor * torch.pow(1 - pt, gamma)
-    loss = -focal_weight * torch.log(pt + 1e-10)
-    return loss.mean()
-
-def freeze_module(module):
-    """Sets requires_grad=False for all parameters in a module."""
-    logger.info(f"Freezing parameters for {module.__class__.__name__}")
-    for param in module.parameters():
-        param.requires_grad = False
-
-def unfreeze_module(module):
-    """Sets requires_grad=True for all parameters in a module."""
-    logger.info(f"Unfreezing parameters for {module.__class__.__name__}")
-    for param in module.parameters():
-        param.requires_grad = True
 
 class ObjectDetectionModel(nn.Module):
     def __init__(self, backbone, rpn, roi_head):
@@ -128,27 +109,6 @@ class ObjectDetectionModel(nn.Module):
             # Get predictions from ROI head 
             predictions = self.process_roi_for_inference(features, proposals, image_list.image_sizes, score_thresh, nms_thresh)
             return predictions 
-        
-        # TRAINING
-        else:
-            if targets is None:
-                raise ValueError("Targets should not be None during training")
-
-            total_losses = {}
-            total_losses.update(proposal_losses)
-
-            if rpn_only:
-                return total_losses
-
-            # Process proposals with ROI head for loss calculation
-            roi_losses = self.process_roi_proposals(features, proposals, targets, image_list.image_sizes)
-
-            # Combine losses from RPN and ROI Head
-            if roi_losses is not None:
-                # Ensure the key matches what train_model expects
-                total_losses['loss_roi'] = roi_losses
-
-            return total_losses
 
     @torch.no_grad()
     def process_rpn_for_inference(self, scores, proposals, targets, image_shapes, score_thresh=SCORE_THRESHOLD, nms_thresh=NMS_THRESHOLD):
@@ -196,121 +156,6 @@ class ObjectDetectionModel(nn.Module):
             results.append({"boxes": final_boxes, "scores": final_scores, "labels": final_labels})
 
         return results
-
-    def process_roi_proposals(self, features, proposals, targets, image_shapes):
-        """
-        Processes proposals through ROI head and calculated loss for training.
-
-        Args:
-            features (Tensor or Dict[str, Tensor]): Feature maps from backbone.
-            proposals (list[Tensor]): Proposals from RPN for each image.
-            targets (list[Tensor]): Targets from dataset for each image.
-
-        Returns:
-            float: Calculated Loss.
-        """
-        batch_size = len(proposals)
-        roi_losses = 0
-        valid_batches = 0 # Count images that contribute to loss
-
-        for img_idx in range(batch_size):
-            img_proposals = proposals[img_idx]
-            target_boxes = targets[img_idx]["boxes"]
-
-            if len(img_proposals) == 0: continue
-            if len(target_boxes) == 0: continue
-
-            iou_matrix = ops.box_iou(img_proposals, target_boxes)
-
-            max_iou, matched_gt_idx = iou_matrix.max(dim=1) # Finds the target that best matches a proposal
-
-            # Assigns -1 to all proposals
-            assigned_labels = torch.full((len(img_proposals),), -1, dtype=torch.float32, device=img_proposals.device)
-            pos_indices = torch.where(max_iou >= ROI_FG_IOU_THRESH)[0]
-            assigned_labels[pos_indices] = 1.0 # Reassigns to 1 if object
-            neg_indices = torch.where(max_iou < ROI_BG_IOU_THRESH_LO)[0]
-            assigned_labels[neg_indices] = 0.0 # Reassigns to 0 if not an object
-
-            # Proposals in between threshold stay -1 => irrelevant
-            valid_indices = torch.where(assigned_labels >= 0)[0]
-            if len(valid_indices) == 0: continue
-
-            rois = torch.cat([
-                torch.full((len(img_proposals), 1), img_idx, device=img_proposals.device),
-                img_proposals
-            ], dim=1)
-
-            # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
-            pooled_features = self.roi_align(features,                
-                                            [img_proposals],          
-                                            [image_shapes[img_idx]]
-                                        )
-            pooled_features = pooled_features.view(pooled_features.size(0), -1)
-
-            # Box refinement
-            # Probability that a bbox includes a Snpwpole
-            box_refinement, class_scores = self.roi_head(pooled_features)
-
-            # Only use fg/bg samples, not the ones in between
-            sampled_assigned_labels = assigned_labels[valid_indices]
-            sampled_class_scores = class_scores[valid_indices].squeeze(-1)
-
-            # Classification
-            # With logits as autocast is unhappy with "normal" BCE
-            roi_class_loss = F.binary_cross_entropy_with_logits(
-                sampled_class_scores, sampled_assigned_labels
-            )
-
-            # roi_class_loss = focal_loss(
-            #     torch.sigmoid(sampled_class_scores), sampled_assigned_labels
-            # )
-
-            # Get the indices of the positive samples within the sampled_assigned_labels
-            pos_mask_in_sampled = (sampled_assigned_labels == 1)
-            pos_indices_in_original = valid_indices[pos_mask_in_sampled]
-
-            # BBox regression
-            if pos_indices_in_original.numel() > 0:
-                # Use indices to select the corresponding box refinements
-                pos_box_refinement = box_refinement[pos_indices_in_original]
-                pos_proposals = img_proposals[pos_indices_in_original]
-                gt_boxes = target_boxes[matched_gt_idx[pos_indices_in_original]]
-
-                # Calculate parameterized regression targets
-                proposal_widths = pos_proposals[:, 2] - pos_proposals[:, 0]
-                proposal_heights = pos_proposals[:, 3] - pos_proposals[:, 1]
-                proposal_x_centers = (pos_proposals[:, 0] + pos_proposals[:, 2]) / 2
-                proposal_y_centers = (pos_proposals[:, 1] + pos_proposals[:, 3]) / 2
-
-                gt_widths = gt_boxes[:, 2] - gt_boxes[:, 0]
-                gt_heights = gt_boxes[:, 3] - gt_boxes[:, 1]
-                gt_x_centers = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
-                gt_y_centers = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
-
-                tx = (gt_x_centers - proposal_x_centers) / proposal_widths
-                ty = (gt_y_centers - proposal_y_centers) / proposal_heights
-                tw = torch.log(gt_widths / proposal_widths)
-                th = torch.log(gt_heights / proposal_heights)
-
-                regression_targets = torch.stack((tx, ty, tw, th), dim=1)
-                
-                roi_bbox_loss = F.smooth_l1_loss(
-                    pos_box_refinement, regression_targets, beta=1.0
-                )
-
-            else:
-                roi_bbox_loss = torch.tensor(0, device=pooled_features.device)
-
-            # Combined loss, might weighting
-            img_loss = CLASSIFICATION_LOSS_WEIGHT * roi_class_loss + BBOX_REGRESSION_LOSS_WEIGHT * roi_bbox_loss
-            
-            if torch.isnan(img_loss) or torch.isinf(img_loss): continue
-
-            roi_losses += img_loss
-            valid_batches += 1
-
-        average_roi_loss = roi_losses / max(valid_batches, 1)
-        return average_roi_loss
 
     @torch.no_grad()
     def process_roi_for_inference(self, features, proposals, image_shapes, score_thresh, nms_thresh):
@@ -404,113 +249,6 @@ class ObjectDetectionModel(nn.Module):
 
         return results
 
-
-def train_model(model, train_loader, val_loader=None, num_epochs=100, freeze_epochs=50, device="cuda"):
-    # Device configuration
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    
-    # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    
-    # Learning rate scheduler
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=LR_SCHEDULER_FACTOR, patience=LR_SCHEDULER_PATIENCE)
-    
-    # Gradient scaler for mixed precision training
-    scaler = GradScaler(device)
-    
-    # Early stopping variables
-    best_val_result = 0.0 #mAP@50 value
-    early_stop_counter = 0
-    
-    # Training loop
-    for epoch in trange(num_epochs, desc="Epochs"):
-        
-        model.train()
-        train_loss = 0.0
-        batch_loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
-        
-        for images, targets in batch_loop:
-            # Move data to device
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass with mixed precision
-            with autocast(str(device)):
-                losses = model(images, targets)
-                loss = sum(loss for loss in losses.values())
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIPPING_MAX_NORM)
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
-            # Update progress
-            batch_loss = loss.item()
-            train_loss += batch_loss
-            batch_loop.set_postfix(loss=f"{batch_loss:.4f}")
-
-        avg_train_loss = train_loss / len(train_loader)
-        logger.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}')
-        
-        # Learning rate scheduling
-        scheduler.step(avg_train_loss)
-
-        # Validation phase
-        if val_loader is not None:
-            val_results = validate_model(model, val_loader, device)
-
-            logger.info(f"Evaluation Results @ Epoch {epoch+1}/{num_epochs}:")
-            logger.info("--------------------------------------")
-            for metric, value in val_results.items():
-                logger.info(f"{metric}: {value:.4f}")
-            logger.info("--------------------------------------")
-            
-            # Early stopping check
-            if val_results['mAP@0.5'] > best_val_result:
-                best_val_result = val_results['mAP@0.5']
-                early_stop_counter = 0
-                
-                # Save best model
-                torch.save({
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "loss": best_val_result,
-                }, "best_model.pt")
-                
-            else:
-                early_stop_counter += 1
-                if early_stop_counter >= EARLY_STOP_PATIENCE and val_results['mAP@0.5'] > 0:
-                    logger.info(f'Early stopping triggered after {epoch+1} epochs')
-                    break
-        
-        if (epoch + 1) % 20 == 0:
-            torch.save({
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "loss": best_val_result,
-                }, f"checkpoint_{epoch+1}.pt")
-
-    
-    # Save final model
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-    }, "final_model.pt")
-    
-    return model
-
-
 def validate_model(model, val_loader, device):
     model.eval()
     
@@ -526,7 +264,7 @@ def validate_model(model, val_loader, device):
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             
             pred_dict = model(images)
-     
+
             metric.update(pred_dict, targets)
 
         results = metric.compute()
@@ -539,10 +277,111 @@ def validate_model(model, val_loader, device):
             'mAR@100': float(results['mar_100'].numpy()) if float(results['mar_100'].numpy()) > 0 else 0,
         }
     
-        return formatted_results
+        logger.info(f"Evaluation Results:")
+        logger.info("--------------------------------------")
+        for metric, value in formatted_results.items():
+            logger.info(f"{metric}: {value:.4f}")
+            logger.info("--------------------------------------")
+        #return formatted_results
+
+def save_predictions(model, data_loader, device, output_dir, score_threshold=SCORE_THRESHOLD):
+    """
+    Runs inference on the data_loader and saves predictions to text files.
+
+    Args:
+        model (nn.Module): The trained object detection model.
+        data_loader (DataLoader): DataLoader providing images, targets, and filenames.
+        device (torch.device): The device to run inference on (e.g., 'cuda').
+        output_dir (str): Directory to save the prediction .txt files.
+        score_threshold (float): Minimum score to keep a detection.
+    """
+    model.eval()  # Set model to evaluation mode
+    os.makedirs(output_dir, exist_ok=True) # Create output directory if it doesn't exist
+    logger.info(f"Saving predictions to: {output_dir}")
+
+    with torch.no_grad(): # Disable gradient calculations
+        for batch in tqdm(data_loader, desc="Saving Predictions"):
+            if batch is None or len(batch) != 3:
+                logger.warning("Skipping empty or malformed batch.")
+                continue
+
+            images, _, filenames = batch # We don't need targets for inference
+
+            if not images or not filenames:
+                logger.warning("Skipping batch with missing images or filenames.")
+                continue
+
+            # Assuming batch_size=1 due to collate_fn_save and dataloader setup
+            if len(images) != 1 or len(filenames) != 1:
+                 logger.error(f"Expected batch size 1, but got {len(images)}. Skipping batch.")
+                 continue
+
+            image_tensor = images[0].to(device) # Get the single image tensor, move to device
+            current_filename = filenames[0]
+
+            # The model expects a list of tensors, even for a single image
+            pred_dict_list = model([image_tensor]) # Pass image tensor within a list
+
+            # Since batch_size=1, pred_dict_list contains results for one image
+            if not pred_dict_list:
+                logger.warning(f"Model returned no predictions for {current_filename}.")
+                continue
+
+            predictions = pred_dict_list[0] # Get the dictionary for the first (only) image
+
+            # Get image dimensions (height, width) from the tensor passed to the model
+            # This assumes the tensor shape is (C, H, W)
+            img_h, img_w = image_tensor.shape[-2:]
+
+            output_filename = os.path.splitext(current_filename)[0] + ".txt"
+            output_filepath = os.path.join(output_dir, output_filename)
+
+            with open(output_filepath, "w") as f:
+                boxes = predictions["boxes"] # Shape: [N, 4] in xyxy format
+                scores = predictions["scores"] # Shape: [N]
+                labels = predictions["labels"] # Shape: [N]
+
+                for i in range(boxes.shape[0]):
+                    score = scores[i].item()
+                    if score < score_threshold:
+                        continue # Skip detections below threshold
+
+                    box = boxes[i].cpu().numpy() # xyxy format
+                    xmin, ymin, xmax, ymax = box
+
+                    # Convert xyxy to normalized xywh format
+                    box_width = xmax - xmin
+                    box_height = ymax - ymin
+                    x_center = (xmin + xmax) / 2
+                    y_center = (ymin + ymax) / 2
+
+                    # Normalize coordinates
+                    norm_x_center = x_center / img_w
+                    norm_y_center = y_center / img_h
+                    norm_width = box_width / img_w
+                    norm_height = box_height / img_h
+
+                    # Clamp normalized values to [0, 1] to avoid floating point issues
+                    norm_x_center = max(0.0, min(1.0, norm_x_center))
+                    norm_y_center = max(0.0, min(1.0, norm_y_center))
+                    norm_width = max(0.0, min(1.0, norm_width))
+                    norm_height = max(0.0, min(1.0, norm_height))
+
+
+                    # *** CLASS ID ***
+                    # Your requested format starts with 0. Your model predicts label 1.
+                    # Using 0 here based on your request. Verify this is correct.
+                    class_id = 0
+                    # If you want the model's predicted label (which is 1 in your setup):
+                    # class_id = labels[i].item()
+
+                    # Format: class x_center y_center width height score
+                    f.write(f"{class_id} {norm_x_center:.6f} {norm_y_center:.6f} {norm_width:.6f} {norm_height:.6f} {score:.6f}\n")
+
+    logger.info("Finished saving predictions.")
+
 
 if __name__ == "__main__":
-    # Model components
     backbone = ConvFPN()
     rpn = RPN
     roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) # Pass number of input features
@@ -550,22 +389,16 @@ if __name__ == "__main__":
     # Create integrated model
     model = ObjectDetectionModel(backbone, rpn, roi_head)
 
-    # Load model 
-    # model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Models/FPN_RPN_NN/checkpoint_60.pt", weights_only=True)
-    # model.load_state_dict(model_params["model_state_dict"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Print model parameters
-    backbone_params = sum(p.numel() for p in backbone.parameters())
-    rpn_params = sum(p.numel() for p in rpn.parameters())
-    roi_params = sum(p.numel() for p in roi_head.parameters())
+    # Load model 
+    model_params = torch.load("/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Current_best_model.pt", weights_only=True, map_location=device)
+    model.load_state_dict(model_params["model_state_dict"])
+
     
-    print("#"*40)
-    print(f"Backbone Parameters: {str(backbone_params).rjust(19)}")
-    print(f"RPN Parameters: {str(rpn_params).rjust(24)}")
-    print(f"ROI Parameters: {str(roi_params).rjust(24)}")
-    print("#"*40)
-    print(f"Total parameters: {str(backbone_params + rpn_params + roi_params).rjust(22)}")
-    print("#"*40)
-    
-    # Train model
-    train_model(model, rgb_trainloader, rgb_validloader, num_epochs=NUM_EPOCHS) 
+    model = model.to(device)
+
+    prediction_output_dir = "/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Test_Predictions"
+
+    # --- Run Prediction Saving ---
+    save_predictions(model, rgb_testloader, device, prediction_output_dir, score_threshold=SCORE_THRESHOLD) # Use the prediction loader

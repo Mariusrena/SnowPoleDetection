@@ -183,5 +183,9 @@ rgb/
 .txt
 
 # Do not include models
-/Trained_Models
+/Trained_Models/
 .pt
+
+/Models/Vim_main/
+
+/Models/ViM_RPN_NN
