@@ -286,7 +286,7 @@ def validate_model(model, val_loader, device):
 
 def save_predictions(model, data_loader, device, output_dir, score_threshold=SCORE_THRESHOLD):
     """
-    Runs inference on the data_loader and saves predictions to text files.
+    Runs inference on a data_loader and saves predictions to text files.
 
     Args:
         model (nn.Module): The trained object detection model.
@@ -295,17 +295,17 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
         output_dir (str): Directory to save the prediction .txt files.
         score_threshold (float): Minimum score to keep a detection.
     """
-    model.eval()  # Set model to evaluation mode
+    model.eval()  
     os.makedirs(output_dir, exist_ok=True) # Create output directory if it doesn't exist
     logger.info(f"Saving predictions to: {output_dir}")
 
-    with torch.no_grad(): # Disable gradient calculations
+    with torch.no_grad():
         for batch in tqdm(data_loader, desc="Saving Predictions"):
             if batch is None or len(batch) != 3:
                 logger.warning("Skipping empty or malformed batch.")
                 continue
 
-            images, _, filenames = batch # We don't need targets for inference
+            images, _, filenames = batch 
 
             if not images or not filenames:
                 logger.warning("Skipping batch with missing images or filenames.")
@@ -316,7 +316,7 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
                  logger.error(f"Expected batch size 1, but got {len(images)}. Skipping batch.")
                  continue
 
-            image_tensor = images[0].to(device) # Get the single image tensor, move to device
+            image_tensor = images[0].to(device) 
             current_filename = filenames[0]
 
             # The model expects a list of tensors, even for a single image
@@ -367,14 +367,8 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
                     norm_width = max(0.0, min(1.0, norm_width))
                     norm_height = max(0.0, min(1.0, norm_height))
 
-
-                    # *** CLASS ID ***
-                    # Your requested format starts with 0. Your model predicts label 1.
-                    # Using 0 here based on your request. Verify this is correct.
                     class_id = 0
-                    # If you want the model's predicted label (which is 1 in your setup):
-                    # class_id = labels[i].item()
-
+                
                     # Format: class x_center y_center width height score
                     f.write(f"{class_id} {norm_x_center:.6f} {norm_y_center:.6f} {norm_width:.6f} {norm_height:.6f} {score:.6f}\n")
 
@@ -384,21 +378,17 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
 if __name__ == "__main__":
     backbone = ConvFPN()
     rpn = RPN
-    roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) # Pass number of input features
+    roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) 
 
-    # Create integrated model
     model = ObjectDetectionModel(backbone, rpn, roi_head)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load model 
     model_params = torch.load("/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Current_best_model.pt", weights_only=True, map_location=device)
     model.load_state_dict(model_params["model_state_dict"])
 
-    
     model = model.to(device)
 
     prediction_output_dir = "/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Test_Predictions"
 
-    # --- Run Prediction Saving ---
-    save_predictions(model, rgb_testloader, device, prediction_output_dir, score_threshold=SCORE_THRESHOLD) # Use the prediction loader
+    save_predictions(model, rgb_testloader, device, prediction_output_dir, score_threshold=SCORE_THRESHOLD) 
