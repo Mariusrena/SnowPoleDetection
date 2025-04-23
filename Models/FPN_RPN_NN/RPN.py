@@ -21,8 +21,13 @@ from FPN_RPN_NN.Hyperparameters import NUM_CNN_OUTPUT_CHANNELS
         Max bbox size: 60490 (pixels)
 """
 
-anchor_sizes = ((18, 38, 60, 120, 256), (18, 38, 60, 120, 256), (18, 38, 60, 120, 256),)
-aspect_ratios = ((5.23, 8.59, 12.06, 16.75, 26.54),) * len(anchor_sizes) 
+# RGB
+#anchor_sizes = ((18, 38, 60, 120, 256), (18, 38, 60, 120, 256), (18, 38, 60, 120, 256),)
+#aspect_ratios = ((5.23, 8.59, 12.06, 16.75, 26.54),) * len(anchor_sizes) 
+
+# LiDAR
+anchor_sizes = ((8, 12, 16, 20, 24), (8, 12, 16, 20, 24), (8, 12, 16, 20, 24),)
+aspect_ratios = ((2.35, 3.31, 4.10, 5.01, 6.31, 8.79),) * len(anchor_sizes) 
 
 anchor_generator = AnchorGenerator(
     sizes=anchor_sizes,
@@ -83,7 +88,6 @@ class CutsomRPN(RegionProposalNetwork):
                 "loss_rpn_box_reg": loss_rpn_box_reg,
             }
         return boxes, scores, losses
-
 
 rpn_head = RPNHead(
     NUM_CNN_OUTPUT_CHANNELS,

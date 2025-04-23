@@ -1,4 +1,3 @@
-
 """ External Imports """
 import torch
 import torch.optim as optim
@@ -27,24 +26,14 @@ sys.path.append(project_root)
 from FPN_RPN_NN.CNN_FPN import ConvFPN
 from FPN_RPN_NN.RPN import RPN
 from FPN_RPN_NN.NN import ROI_NN
-from Tools.predict_dataloader import rgb_testloader, collate_fn_save
+from Tools.predict_dataloader import rgb_testloader, lidar_testloader, collate_fn_save
 
 from FPN_RPN_NN.Hyperparameters import (
                                     ROI_ALIGN_OUTPUT_SIZE,
                                     SAMPLE_RATIO,
                                     NUM_CNN_OUTPUT_CHANNELS,
-                                    ROI_FG_IOU_THRESH,
-                                    ROI_BG_IOU_THRESH_LO, 
-                                    CLASSIFICATION_LOSS_WEIGHT, 
-                                    BBOX_REGRESSION_LOSS_WEIGHT, 
                                     SCORE_THRESHOLD,
                                     NMS_THRESHOLD,
-                                    LR, 
-                                    LR_SCHEDULER_FACTOR, 
-                                    LR_SCHEDULER_PATIENCE,
-                                    EARLY_STOP_PATIENCE,
-                                    GRADIENT_CLIPPING_MAX_NORM,
-                                    NUM_EPOCHS,
                                     RPN_ONLY,)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -97,7 +86,6 @@ class ObjectDetectionModel(nn.Module):
 
         # Get proposals from RPN
         # Pass targets only during training
-
         proposals, rpn_scores, proposal_losses = self.rpn(image_list, features, targets if self.training else None)
 
         # INFERENCE
@@ -178,11 +166,6 @@ class ObjectDetectionModel(nn.Module):
             img_proposals = proposals[img_idx]
 
             if len(img_proposals) == 0: continue
-
-            rois = torch.cat([
-                torch.full((len(img_proposals), 1), img_idx, device=img_proposals.device),
-                img_proposals
-            ], dim=1)
 
             # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
             pooled_features = self.roi_align(features,                
@@ -286,7 +269,7 @@ def validate_model(model, val_loader, device):
 
 def save_predictions(model, data_loader, device, output_dir, score_threshold=SCORE_THRESHOLD):
     """
-    Runs inference on a data_loader and saves predictions to text files.
+    Runs inference on the data_loader and saves predictions to text files.
 
     Args:
         model (nn.Module): The trained object detection model.
@@ -296,10 +279,10 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
         score_threshold (float): Minimum score to keep a detection.
     """
     model.eval()  
-    os.makedirs(output_dir, exist_ok=True) # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True) 
     logger.info(f"Saving predictions to: {output_dir}")
 
-    with torch.no_grad():
+    with torch.no_grad(): #
         for batch in tqdm(data_loader, desc="Saving Predictions"):
             if batch is None or len(batch) != 3:
                 logger.warning("Skipping empty or malformed batch.")
@@ -311,23 +294,20 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
                 logger.warning("Skipping batch with missing images or filenames.")
                 continue
 
-            # Assuming batch_size=1 due to collate_fn_save and dataloader setup
             if len(images) != 1 or len(filenames) != 1:
                  logger.error(f"Expected batch size 1, but got {len(images)}. Skipping batch.")
                  continue
 
-            image_tensor = images[0].to(device) 
+            image_tensor = images[0].to(device)
             current_filename = filenames[0]
 
-            # The model expects a list of tensors, even for a single image
-            pred_dict_list = model([image_tensor]) # Pass image tensor within a list
+            pred_dict_list = model([image_tensor]) 
 
-            # Since batch_size=1, pred_dict_list contains results for one image
             if not pred_dict_list:
                 logger.warning(f"Model returned no predictions for {current_filename}.")
                 continue
 
-            predictions = pred_dict_list[0] # Get the dictionary for the first (only) image
+            predictions = pred_dict_list[0] 
 
             # Get image dimensions (height, width) from the tensor passed to the model
             # This assumes the tensor shape is (C, H, W)
@@ -344,51 +324,46 @@ def save_predictions(model, data_loader, device, output_dir, score_threshold=SCO
                 for i in range(boxes.shape[0]):
                     score = scores[i].item()
                     if score < score_threshold:
-                        continue # Skip detections below threshold
+                        continue # Skip detections below threshold (Should not be a problem, done internally)
 
-                    box = boxes[i].cpu().numpy() # xyxy format
+                    box = boxes[i].cpu().numpy()
                     xmin, ymin, xmax, ymax = box
 
-                    # Convert xyxy to normalized xywh format
                     box_width = xmax - xmin
                     box_height = ymax - ymin
                     x_center = (xmin + xmax) / 2
                     y_center = (ymin + ymax) / 2
 
-                    # Normalize coordinates
                     norm_x_center = x_center / img_w
                     norm_y_center = y_center / img_h
                     norm_width = box_width / img_w
                     norm_height = box_height / img_h
 
-                    # Clamp normalized values to [0, 1] to avoid floating point issues
                     norm_x_center = max(0.0, min(1.0, norm_x_center))
                     norm_y_center = max(0.0, min(1.0, norm_y_center))
                     norm_width = max(0.0, min(1.0, norm_width))
                     norm_height = max(0.0, min(1.0, norm_height))
 
                     class_id = 0
-                
-                    # Format: class x_center y_center width height score
+                    
                     f.write(f"{class_id} {norm_x_center:.6f} {norm_y_center:.6f} {norm_width:.6f} {norm_height:.6f} {score:.6f}\n")
 
     logger.info("Finished saving predictions.")
 
-
 if __name__ == "__main__":
     backbone = ConvFPN()
     rpn = RPN
-    roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) 
+    roi_head = ROI_NN(int(NUM_CNN_OUTPUT_CHANNELS*ROI_ALIGN_OUTPUT_SIZE**2)) # Pass number of input features
 
     model = ObjectDetectionModel(backbone, rpn, roi_head)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model_params = torch.load("/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Current_best_model.pt", weights_only=True, map_location=device)
+    # Load model 
+    model_params = torch.load("/home/mariumre/Documents/SnowPoleDetection/Trained_Models/12.9M/LIiDAR/best_model_lidar.pt", weights_only=True)
     model.load_state_dict(model_params["model_state_dict"])
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    prediction_output_dir = "/home/marius/Documents/NTNU/TDT4265/SnowPoleDetection/Trained_Models/15M/Test_Predictions"
+    prediction_output_dir = "/home/mariumre/Documents/SnowPoleDetection/Trained_Models/12.9M/LIiDAR/Test_Prediction"
 
-    save_predictions(model, rgb_testloader, device, prediction_output_dir, score_threshold=SCORE_THRESHOLD) 
+    save_predictions(model, lidar_testloader, device, prediction_output_dir, score_threshold=SCORE_THRESHOLD) # Use the prediction loader

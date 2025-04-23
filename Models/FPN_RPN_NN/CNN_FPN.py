@@ -49,7 +49,7 @@ class ResidualBlock(nn.Module):
         return x
 
 class ConvFPN(nn.Module):
-    def __init__(self):
+    def __init__(self, init_weights = False):
         super().__init__()
         self.conv_layer1 = ConvBlock(3, 128, True, kernel_size=3, stride=1)
         self.res_block1 = ResidualBlock(128, True, 2)
@@ -69,7 +69,8 @@ class ConvFPN(nn.Module):
         self.out4 = nn.Conv2d(NUM_CNN_OUTPUT_CHANNELS, NUM_CNN_OUTPUT_CHANNELS, 3, padding=1)
         self.out5 = nn.Conv2d(NUM_CNN_OUTPUT_CHANNELS, NUM_CNN_OUTPUT_CHANNELS, 3, padding=1)
 
-        #self._initialize_weights()
+        if init_weights:
+            self._initialize_weights()
 
     def _initialize_weights(self):
         print("Initializing weights...")

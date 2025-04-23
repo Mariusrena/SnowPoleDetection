@@ -52,7 +52,6 @@ class ROI_NN(nn.Module):
 
         return bbox, prob
     
-# Used to print number of parameters in this architecture    
 if __name__ == "__main__":
     net = ROI_NN(25088)
     total_params = sum(p.numel() for p in net.parameters())

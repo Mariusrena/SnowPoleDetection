@@ -26,7 +26,11 @@ sys.path.append(project_root)
 from FPN_RPN_NN.CNN_FPN import ConvFPN
 from FPN_RPN_NN.RPN import RPN
 from FPN_RPN_NN.NN import ROI_NN
-from Tools.rgb_dataloader import rgb_trainloader, rgb_validloader
+from Tools.rgb_dataloader import (
+                                rgb_trainloader, 
+                                rgb_validloader, 
+                                rgb_combinedloader, 
+                                lidar_combinedloader,)
 
 from FPN_RPN_NN.Hyperparameters import (
                                     ROI_ALIGN_OUTPUT_SIZE,
@@ -49,22 +53,30 @@ from FPN_RPN_NN.Hyperparameters import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+"""
+    Compute focal loss for binary classification.
+    Not currently used. Might be useful for extremely skewed datasets.
+"""
 def focal_loss(prediction, target, alpha=0.75, gamma=2.0):
-    """Compute focal loss for binary classification"""
     pt = torch.where(target == 1, prediction, 1 - prediction)
     alpha_factor = torch.where(target == 1, alpha, 1 - alpha)
     focal_weight = alpha_factor * torch.pow(1 - pt, gamma)
     loss = -focal_weight * torch.log(pt + 1e-10)
     return loss.mean()
 
+"""
+    Sets requires_grad=False for all parameters in a module.
+"""
 def freeze_module(module):
-    """Sets requires_grad=False for all parameters in a module."""
     logger.info(f"Freezing parameters for {module.__class__.__name__}")
     for param in module.parameters():
         param.requires_grad = False
 
+"""
+    Sets requires_grad=True for all parameters in a module.
+"""
 def unfreeze_module(module):
-    """Sets requires_grad=True for all parameters in a module."""
     logger.info(f"Unfreezing parameters for {module.__class__.__name__}")
     for param in module.parameters():
         param.requires_grad = True
@@ -235,11 +247,6 @@ class ObjectDetectionModel(nn.Module):
             valid_indices = torch.where(assigned_labels >= 0)[0]
             if len(valid_indices) == 0: continue
 
-            rois = torch.cat([
-                torch.full((len(img_proposals), 1), img_idx, device=img_proposals.device),
-                img_proposals
-            ], dim=1)
-
             # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
             pooled_features = self.roi_align(features,                
                                             [img_proposals],          
@@ -333,11 +340,6 @@ class ObjectDetectionModel(nn.Module):
             img_proposals = proposals[img_idx]
 
             if len(img_proposals) == 0: continue
-
-            rois = torch.cat([
-                torch.full((len(img_proposals), 1), img_idx, device=img_proposals.device),
-                img_proposals
-            ], dim=1)
 
             # The feature maps from the backbone is aligened with the RPN map to use in the ROI head
             pooled_features = self.roi_align(features,                
